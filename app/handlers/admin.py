@@ -27,6 +27,9 @@ def kb_admin():
     kb.button(text='Добавить аккаунт', callback_data='adm_add_account')
     kb.button(text='Чаты', callback_data='adm_chats')
     kb.button(text='Мониторинг', callback_data='adm_status')
+    kb.button(text='⚙️ Настройки парсера и доступа', callback_data='adm_settings')
+    kb.button(text='👥 Пользователи и доступы', callback_data='adm_users')
+    kb.button(text='💳 Платежи', callback_data='adm_payments')
     kb.button(text='🗑 Очистить найденные NFT-профили', callback_data='adm_db_reset')
     kb.adjust(1)
     return kb.as_markup()
@@ -512,3 +515,183 @@ async def db_reset_confirm(c: CallbackQuery):
         )
 
 
+
+
+# --- Business controls: runtime limits, users, access and payment ledger ---
+
+@router.callback_query(F.data == 'adm_settings')
+async def admin_settings_page(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True); return
+    from app.services.bot_settings import get_value
+    keys = [
+        ('parser_max_results', 'Максимум NFT-профилей за поиск'),
+        ('trial_max_profiles', 'Лимит пробного доступа'),
+        ('parser_cooldown_seconds', 'Кулдаун пользователей (сек.)'),
+        ('access_hours', 'Длительность покупки (часов)'),
+        ('ton_price', 'Цена доступа (TON)'),
+    ]
+    lines = ['⚙️ Настройки бота']
+    kb = InlineKeyboardBuilder()
+    for key, title in keys:
+        value = await get_value(key)
+        lines.append(f'• {title}: {value}')
+        kb.button(text=f'{title}: {value}', callback_data=f'adm_edit:{key}')
+    kb.button(text='⬅️ В админку', callback_data='adm_home')
+    kb.adjust(1)
+    await c.message.edit_text('\\n'.join(lines) + '\\n\\nВыберите параметр для изменения:', reply_markup=kb.as_markup())
+    await c.answer()
+
+@router.callback_query(F.data == 'adm_home')
+async def admin_home_callback(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True); return
+    await c.message.edit_text('Панель администратора', reply_markup=kb_admin())
+    await c.answer()
+
+@router.callback_query(F.data.startswith('adm_edit:'))
+async def admin_edit_setting(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True); return
+    key = c.data.split(':', 1)[1]
+    choices = {
+        'parser_max_results': [1, 3, 5, 10, 20, 50, 100],
+        'trial_max_profiles': [1, 3, 5, 10, 20],
+        'parser_cooldown_seconds': [0, 60, 300, 600, 1800, 3600],
+        'access_hours': [1, 6, 12, 24, 72, 168, 720],
+        'ton_price': [1, 2, 3, 5, 10, 20],
+    }
+    if key not in choices:
+        await c.answer('Неизвестная настройка', show_alert=True); return
+    from app.services.bot_settings import get_value
+    current = await get_value(key)
+    kb = InlineKeyboardBuilder()
+    for value in choices[key]:
+        kb.button(text=f'{"✓ " if value == current else ""}{value}', callback_data=f'adm_set:{key}:{value}')
+    kb.button(text='⬅️ Назад', callback_data='adm_settings')
+    kb.adjust(3, 1)
+    await c.message.edit_text(f'Выберите новое значение для {key}.\\nТекущее: {current}', reply_markup=kb.as_markup())
+    await c.answer()
+
+@router.callback_query(F.data.startswith('adm_set:'))
+async def admin_set_setting(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True); return
+    _, key, raw = c.data.split(':', 2)
+    from app.services.bot_settings import set_value
+    try:
+        await set_value(key, int(raw))
+    except Exception as exc:
+        await c.answer(f'Ошибка: {str(exc)[:100]}', show_alert=True); return
+    await admin_settings_page(c)
+
+@router.callback_query(F.data == 'adm_users')
+async def admin_users_page(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True); return
+    async with Session() as db:
+        total = await db.scalar(select(func.count(User.id))) or 0
+        active = await db.scalar(select(func.count(User.id)).where(User.access_until > __import__('datetime').datetime.now(__import__('datetime').timezone.utc))) or 0
+        recent = (await db.scalars(select(User).order_by(User.created_at.desc()).limit(10))).all()
+    lines = [f'👥 Пользователи: {total}', f'Активные платные доступы: {active}', '', 'Последние 10:']
+    kb = InlineKeyboardBuilder()
+    for u in recent:
+        lines.append(f'ID {u.id} · @{u.username or "нет username"}')
+        kb.button(text=f'Открыть {u.id}', callback_data=f'adm_user:{u.id}')
+    kb.button(text='⬅️ В админку', callback_data='adm_home')
+    kb.adjust(1)
+    await c.message.edit_text('\\n'.join(lines) + '\\n\\nДля выдачи доступа: /grant ID ЧАСЫ. Для отзыва: /revoke ID.', reply_markup=kb.as_markup())
+    await c.answer()
+
+@router.callback_query(F.data.startswith('adm_user:'))
+async def admin_user_detail(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True); return
+    uid = int(c.data.split(':', 1)[1])
+    async with Session() as db:
+        u = await db.get(User, uid)
+        payments = (await db.scalars(select(Payment).where(Payment.user_id == uid).order_by(Payment.created_at.desc()).limit(5))).all()
+        profiles = await db.scalar(select(func.count(OwnerProfile.id)).where(OwnerProfile.issued_to_user_id == uid)) or 0
+    if not u:
+        await c.answer('Пользователь не найден', show_alert=True); return
+    until = u.access_until.isoformat() if u.access_until else 'нет'
+    text = (f'Пользователь {uid}\\nUsername: @{u.username or "—"}\\nСоздан: {u.created_at}\\n'
+            f'Доступ до: {until}\\nПробный использован: {u.trial_used}\\n'
+            f'Профилей в пробном: {u.trial_profiles_sent}\\nВыдано NFT-профилей: {profiles}\\n'
+            f'Платежей: {len(payments)}')
+    kb = InlineKeyboardBuilder()
+    kb.button(text='➕ Выдать 24 часа', callback_data=f'adm_grant24:{uid}')
+    kb.button(text='⛔ Отозвать доступ', callback_data=f'adm_revoke:{uid}')
+    kb.button(text='⬅️ Пользователи', callback_data='adm_users')
+    kb.adjust(1)
+    await c.message.edit_text(text, reply_markup=kb.as_markup())
+    await c.answer()
+
+@router.callback_query(F.data.startswith('adm_grant24:'))
+async def admin_grant_24(c: CallbackQuery, bot):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True); return
+    uid = int(c.data.split(':', 1)[1])
+    from app.services.access import grant_access
+    await grant_access(uid, 24)
+    try: await bot.send_message(uid, '🎁 Администратор выдал вам 24 часа доступа.')
+    except Exception: pass
+    await admin_user_detail(c)
+
+@router.callback_query(F.data.startswith('adm_revoke:'))
+async def admin_revoke(c: CallbackQuery, bot):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True); return
+    uid = int(c.data.split(':', 1)[1])
+    async with Session() as db:
+        u = await db.get(User, uid)
+        if u:
+            u.access_until = None
+            await db.commit()
+    try: await bot.send_message(uid, 'Ваш платный доступ был отключён администратором.')
+    except Exception: pass
+    await admin_user_detail(c)
+
+@router.callback_query(F.data == 'adm_payments')
+async def admin_payments(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True); return
+    async with Session() as db:
+        rows = (await db.scalars(select(Payment).order_by(Payment.created_at.desc()).limit(20))).all()
+        total = await db.scalar(select(func.count(Payment.id))) or 0
+        confirmed = await db.scalar(select(func.count(Payment.id)).where(Payment.status == 'confirmed')) or 0
+    lines = [f'💳 Платежи: {total}', f'Успешных: {confirmed}', '', 'Последние 20:']
+    for p in rows:
+        lines.append(f'#{p.id} · user {p.user_id} · {p.amount_nano / 1_000_000_000:g} TON · {p.status}')
+    kb = InlineKeyboardBuilder(); kb.button(text='⬅️ В админку', callback_data='adm_home')
+    await c.message.edit_text('\\n'.join(lines), reply_markup=kb.as_markup())
+    await c.answer()
+
+@router.message(Command('grant'))
+async def admin_grant_command(m: Message, bot):
+    if not admin(m): return
+    parts = (m.text or '').split()
+    if len(parts) != 3 or not all(x.isdigit() for x in parts[1:]):
+        await m.answer('Формат: /grant TELEGRAM_ID ЧАСЫ'); return
+    uid, hours = map(int, parts[1:])
+    from app.services.access import grant_access
+    await grant_access(uid, hours)
+    try: await bot.send_message(uid, f'🎁 Вам выдан доступ на {hours} ч.')
+    except Exception: pass
+    await m.answer(f'Доступ пользователю {uid} выдан на {hours} ч.')
+
+@router.message(Command('revoke'))
+async def admin_revoke_command(m: Message, bot):
+    if not admin(m): return
+    parts = (m.text or '').split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await m.answer('Формат: /revoke TELEGRAM_ID'); return
+    uid = int(parts[1])
+    async with Session() as db:
+        u = await db.get(User, uid)
+        if not u: await m.answer('Пользователь не найден.'); return
+        u.access_until = None
+        await db.commit()
+    try: await bot.send_message(uid, 'Ваш доступ отключён администратором.')
+    except Exception: pass
+    await m.answer(f'Доступ пользователя {uid} отозван.')

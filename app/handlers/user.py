@@ -24,11 +24,17 @@ def subscribed_kb():
     kb=InlineKeyboardBuilder(); kb.button(text='Подписаться',url=settings.required_channel_url); kb.button(text='Проверить подписку',callback_data='check_sub'); kb.adjust(1); return kb.as_markup()
 
 async def ensure_user(tg):
+    created = False
     async with Session() as db:
         u=await db.get(User,tg.id)
-        if not u: u=User(id=tg.id,username=tg.username); db.add(u)
+        if not u:
+            u=User(id=tg.id,username=tg.username); db.add(u); created = True
         else: u.username=tg.username
-        await db.commit(); return u
+        await db.commit()
+    if created:
+        from app.services.notifications import notify_admins
+        await notify_admins(f"🆕 Новый пользователь: {tg.full_name or 'Без имени'}\nID: {tg.id}\nUsername: @{tg.username}" if tg.username else f"🆕 Новый пользователь\nID: {tg.id}")
+    return u
 
 async def is_subscribed(bot, uid):
     if not settings.required_channel_id: return True
@@ -51,13 +57,18 @@ async def start(m:Message,bot):
         except ValueError: pass
     if not await is_subscribed(bot,m.from_user.id):
         await m.answer('Для использования бота необходимо подписаться на канал.',reply_markup=subscribed_kb()); return
-    active=bool((u.access_until and u.access_until>datetime.now(timezone.utc)) or (u.trial_used and u.trial_profiles_sent < settings.trial_max_profiles))
+    from app.services.bot_settings import get_value
+    trial_limit = await get_value("trial_max_profiles")
+    active=bool(m.from_user.id in settings.admins or (u.access_until and u.access_until>datetime.now(timezone.utc)) or (u.trial_used and u.trial_profiles_sent < trial_limit))
     await m.answer('Привет! Выбери действие.',reply_markup=menu(active))
 
 @router.callback_query(F.data=='check_sub')
 async def check_sub(c:CallbackQuery,bot):
     if await is_subscribed(bot,c.from_user.id):
-        u=await ensure_user(c.from_user); active=bool((u.access_until and u.access_until>datetime.now(timezone.utc)) or (u.trial_used and u.trial_profiles_sent < settings.trial_max_profiles))
+        u=await ensure_user(c.from_user)
+        from app.services.bot_settings import get_value
+        trial_limit = await get_value("trial_max_profiles")
+        active=bool(c.from_user.id in settings.admins or (u.access_until and u.access_until>datetime.now(timezone.utc)) or (u.trial_used and u.trial_profiles_sent < trial_limit))
         await c.message.edit_text('Подписка подтверждена. Выбери действие.',reply_markup=menu(active))
     else: await c.answer('Подписка пока не найдена.',show_alert=True)
 
@@ -67,7 +78,11 @@ async def trial(c:CallbackQuery):
         u=await db.get(User,c.from_user.id)
         if u.trial_used: await c.answer('Пробный период уже использован.',show_alert=True); return
         u.trial_used=True; u.access_until=None; await db.commit()
-    await c.message.edit_text(f'Пробный доступ активирован. Лимит: {settings.trial_max_profiles} найденных профиля.',reply_markup=menu(True))
+    from app.services.bot_settings import get_value
+    from app.services.notifications import notify_admins
+    trial_limit = await get_value("trial_max_profiles")
+    await notify_admins(f"🎁 Активирован пробный доступ\nПользователь: {c.from_user.full_name}\nID: {c.from_user.id}")
+    await c.message.edit_text(f'Пробный доступ активирован. Лимит: {trial_limit} профилей.',reply_markup=menu(True))
 
 @router.callback_query(F.data=='buy')
 async def buy(c:CallbackQuery):

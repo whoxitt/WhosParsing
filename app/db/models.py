@@ -78,3 +78,10 @@ class ReferralReward(Base):
     referred_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('users.id'), unique=True)
     hours: Mapped[int] = mapped_column(Integer, default=24)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class BotSetting(Base):
+    __tablename__ = 'bot_settings'
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)

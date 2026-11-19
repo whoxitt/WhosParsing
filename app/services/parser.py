@@ -159,19 +159,27 @@ class ParserService:
                         await send_status('Пользователь не найден. Выполните /start.', False)
                         return
                     paid_active = bool(user.access_until and user.access_until > now)
-                    trial_active = bool(user.trial_used and user.trial_profiles_sent < settings.trial_max_profiles)
-                    if not paid_active and not trial_active:
+                    from app.services.bot_settings import get_value
+                    trial_limit = await get_value("trial_max_profiles")
+                    trial_active = bool(user.trial_used and user.trial_profiles_sent < trial_limit)
+                    if not paid_active and not trial_active and telegram_user_id not in settings.admins:
                         await send_status('Доступ не активен или лимит пробного периода исчерпан. Оформите доступ в главном меню.', False)
                         return
-                    if user.last_parser_at and now - user.last_parser_at < timedelta(seconds=settings.parser_cooldown_seconds):
-                        left = int(settings.parser_cooldown_seconds - (now - user.last_parser_at).total_seconds())
+                    from app.services.bot_settings import get_value
+                    cooldown_seconds = await get_value("parser_cooldown_seconds")
+                    max_results = await get_value("parser_max_results")
+                    trial_limit = await get_value("trial_max_profiles")
+                    is_admin = telegram_user_id in settings.admins
+                    if not is_admin and user.last_parser_at and now - user.last_parser_at < timedelta(seconds=cooldown_seconds):
+                        left = int(cooldown_seconds - (now - user.last_parser_at).total_seconds())
                         await send_status(f'Следующий запуск будет доступен через {max(left, 1)} сек.', False)
                         return
-                    user.last_parser_at = now
-                    trial_remaining = settings.trial_max_profiles - user.trial_profiles_sent
+                    if not is_admin:
+                        user.last_parser_at = now
+                    trial_remaining = trial_limit - user.trial_profiles_sent
                     await db.commit()
 
-                target = settings.parser_max_results if paid_active else max(0, trial_remaining)
+                target = max_results if paid_active or is_admin else max(0, trial_remaining)
                 sent = 0
                 attempted_count = 0
                 successful_checks = 0
@@ -350,5 +358,11 @@ class ParserService:
                         "и совместимость метода получения подарков; нулевой результат нельзя считать достоверным."
                     )
                 await send_status(final_text, False)
+                from app.services.notifications import notify_admins
+                await notify_admins(
+                    f"✅ Парсинг завершён\nПользователь ID: {telegram_user_id}\n"
+                    f"Найдено профилей: {sent}/{target}\nПроверено: {successful_checks}/{attempted_count}\n"
+                    f"Ошибок: {access_errors + notification_errors}"
+                )
             finally:
                 self.stop_events.pop(telegram_user_id, None)

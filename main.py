@@ -1,4 +1,5 @@
 import asyncio, logging
+from html import escape
 from aiogram import Bot, Dispatcher, F
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.config import settings
@@ -36,20 +37,37 @@ async def parser_go(c, bot):
                 logging.debug('Could not edit parser status message: %s', exc)
 
     async def result(username, uid, count, links, chat):
-        # Use a plain text message: a rejected tg:// inline button must not
-        # make a successfully discovered NFT look like an access failure.
-        name = '@' + username if username else f'Telegram ID: {uid}'
-        lines = [
-            '🎁 Найден владелец коллекционного NFT',
-            name,
-            f'Telegram ID: {uid}',
-            f'Количество коллекционных NFT: {count}',
-        ]
-        if links:
-            lines.append('NFT-ссылки:')
-            lines.extend(links)
-        lines.append(f'Источник: {chat}')
-        await bot.send_message(c.from_user.id, '\n'.join(lines), disable_web_page_preview=True)
+        # A compact HTML card with a direct profile button and clickable NFT links.
+        display_name = f'@{escape(username)}' if username else f'ID {uid}'
+        gift_lines = []
+        for link in links or []:
+            safe_link = escape(str(link), quote=True)
+            gift_lines.append(f'  • <a href="{safe_link}">{safe_link}</a>')
+        gifts_block = '\\n'.join(gift_lines) if gift_lines else '  • Ссылки не получены'
+        profile_url = f'https://t.me/{username}' if username else f'tg://user?id={uid}'
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text='👤 Перейти в профиль', url=profile_url)
+        kb.adjust(1)
+
+        message = (
+            '🎁 <b>Найден владелец NFT</b>\\n'
+            '━━━━━━━━━━━━━━━━━━\\n'
+            f'👤 <b>Профиль:</b> {display_name}\\n'
+            f'🆔 <b>Telegram ID:</b> <code>{uid}</code>\\n'
+            f'💎 <b>Коллекционных NFT:</b> {count}\\n'
+            '━━━━━━━━━━━━━━━━━━\\n'
+            f'🔗 <b>NFT подарки:</b>\\n{gifts_block}\\n'
+            '━━━━━━━━━━━━━━━━━━\\n'
+            f'💬 <b>Найден в чате:</b> {escape(str(chat))}'
+        )
+        await bot.send_message(
+            c.from_user.id,
+            message,
+            parse_mode='HTML',
+            reply_markup=kb.as_markup(),
+            disable_web_page_preview=True,
+        )
 
     async def run_job():
         try:
@@ -74,7 +92,11 @@ async def main():
     await init_db(); await accounts.restore_all()
     admin.account_manager=accounts
     admin.parser_service=parser
-    bot=Bot(settings.bot_token); dp=Dispatcher()
+    bot=Bot(settings.bot_token)
+    from app.services import notifications
+    notifications.bot = bot
+    parser.bot = bot
+    dp=Dispatcher()
     user.router.callback_query.register(parser_callback, F.data == 'parser')
     user.router.callback_query.register(parser_go, F.data == 'parser_go')
     user.router.callback_query.register(parser_stop, F.data == 'parser_stop')

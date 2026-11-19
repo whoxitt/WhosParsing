@@ -14,13 +14,15 @@ class TonService:
 
     async def create_invoice(self, user_id: int):
         memo = self.new_memo()
-        nano = int(settings.ton_price * 1_000_000_000)
+        from app.services.bot_settings import get_value
+        price = await get_value("ton_price")
+        nano = int(price * 1_000_000_000)
         async with Session() as db:
             p = Payment(user_id=user_id, memo=memo, amount_nano=nano,
                         expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.payment_ttl_minutes))
             db.add(p)
             await db.commit()
-        return memo, settings.ton_price
+        return memo, price
 
     async def recent_transactions(self):
         if not settings.ton_wallet_address or not settings.ton_api_token:
@@ -98,9 +100,13 @@ class TonService:
                 p.confirmed_at = datetime.now(timezone.utc)
                 await db.commit()
                 from app.services.access import grant_access, grant_referral
-                await grant_access(p.user_id, settings.access_hours)
+                from app.services.bot_settings import get_value
+                from app.services.notifications import notify_admins
+                access_hours = await get_value("access_hours")
+                await grant_access(p.user_id, access_hours)
                 await grant_referral(p.user_id)
                 try:
-                    await bot.send_message(p.user_id, 'Оплата подтверждена. Доступ активирован на 24 часа.')
+                    await bot.send_message(p.user_id, f'Оплата подтверждена. Доступ активирован на {access_hours} ч.')
                 except Exception:
                     pass
+                await notify_admins(f"💰 Успешная покупка доступа\\nПользователь ID: {p.user_id}\\nСумма: {amount / 1_000_000_000:.4f} TON\\nПлатёж ID: {p.id}\\nTX: {tx_hash}")
