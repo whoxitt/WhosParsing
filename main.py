@@ -37,37 +37,11 @@ async def parser_go(c, bot):
                 logging.debug('Could not edit parser status message: %s', exc)
 
     async def result(username, uid, count, links, chat):
-        # A compact HTML card with a direct profile button and clickable NFT links.
-        display_name = f'@{escape(username)}' if username else f'ID {uid}'
-        gift_lines = []
-        for link in links or []:
-            safe_link = escape(str(link), quote=True)
-            gift_lines.append(f'  • <a href="{safe_link}">{safe_link}</a>')
-        gifts_block = '\\n'.join(gift_lines) if gift_lines else '  • Ссылки не получены'
-        profile_url = f'https://t.me/{username}' if username else f'tg://user?id={uid}'
+        # Compact owner card: username and NFT count only, no emojis or NFT links.
+        from app.services.formatting import format_user
+        message = f"Юз: {format_user(username, uid)}\nNFT: {count}"
+        await bot.send_message(c.from_user.id, message)
 
-        kb = InlineKeyboardBuilder()
-        kb.button(text='👤 Перейти в профиль', url=profile_url)
-        kb.adjust(1)
-
-        message = (
-            '🎁 <b>Найден владелец NFT</b>\\n'
-            '━━━━━━━━━━━━━━━━━━\\n'
-            f'👤 <b>Профиль:</b> {display_name}\\n'
-            f'🆔 <b>Telegram ID:</b> <code>{uid}</code>\\n'
-            f'💎 <b>Коллекционных NFT:</b> {count}\\n'
-            '━━━━━━━━━━━━━━━━━━\\n'
-            f'🔗 <b>NFT подарки:</b>\\n{gifts_block}\\n'
-            '━━━━━━━━━━━━━━━━━━\\n'
-            f'💬 <b>Найден в чате:</b> {escape(str(chat))}'
-        )
-        await bot.send_message(
-            c.from_user.id,
-            message,
-            parse_mode='HTML',
-            reply_markup=kb.as_markup(),
-            disable_web_page_preview=True,
-        )
 
     async def run_job():
         try:

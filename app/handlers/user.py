@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+import logging
+from html import escape
 from aiogram import Router, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery
@@ -33,7 +35,8 @@ async def ensure_user(tg):
         await db.commit()
     if created:
         from app.services.notifications import notify_admins
-        await notify_admins(f"🆕 Новый пользователь: {tg.full_name or 'Без имени'}\nID: {tg.id}\nUsername: @{tg.username}" if tg.username else f"🆕 Новый пользователь\nID: {tg.id}")
+        from app.services.formatting import format_user
+        await notify_admins(f"Новый пользователь\nЮз: {format_user(tg.username, tg.id)}\nID: {tg.id}")
     return u
 
 async def is_subscribed(bot, uid):
@@ -81,7 +84,8 @@ async def trial(c:CallbackQuery):
     from app.services.bot_settings import get_value
     from app.services.notifications import notify_admins
     trial_limit = await get_value("trial_max_profiles")
-    await notify_admins(f"🎁 Активирован пробный доступ\nПользователь: {c.from_user.full_name}\nID: {c.from_user.id}")
+    from app.services.formatting import format_user
+    await notify_admins(f"Активирован пробный доступ\nЮз: {format_user(c.from_user.username, c.from_user.id)}\nЛимит NFT: {trial_limit}")
     await c.message.edit_text(f'Пробный доступ активирован. Лимит: {trial_limit} профилей.',reply_markup=menu(True))
 
 @router.callback_query(F.data=='buy')
@@ -89,15 +93,31 @@ async def buy(c:CallbackQuery):
     if not settings.ton_wallet_address or not settings.ton_api_token:
         await c.answer('Оплата пока не настроена администратором.',show_alert=True)
         return
-    memo, amount = await ton.create_invoice(c.from_user.id)
+    await c.answer()
+    try:
+        memo, amount = await ton.create_invoice(c.from_user.id)
+    except Exception:
+        logging.exception('Could not create TON invoice for user %s', c.from_user.id)
+        await c.answer('Не удалось создать счёт. Попробуйте позже.', show_alert=True)
+        return
     kb = InlineKeyboardBuilder()
     kb.button(text='Проверить оплату', callback_data='check_payment')
+    kb.button(text='История моих платежей', callback_data='my_payments')
+    kb.button(text='Открыть кошелёк', url=f'https://tonviewer.com/{settings.ton_wallet_address}')
+    kb.adjust(1)
     await c.message.answer(
-        f'Счёт на {amount} TON\nКошелёк: `{settings.ton_wallet_address}`\n'
-        f'Комментарий (memo): `{memo}`\n\n'
-        'Отправьте точную сумму с указанным комментарием. Зачисление после подтверждения сети.',
-        parse_mode='Markdown',
+        '<b>Покупка доступа</b>\n'
+        '━━━━━━━━━━━━━━━━━━\n'
+        f'<b>К оплате:</b> {amount} TON\n'
+        f'<b>Кошелёк:</b> <code>{escape(settings.ton_wallet_address)}</code>\n'
+        f'<b>Комментарий:</b> <code>{escape(memo)}</code>\n'
+        f'<b>Срок действия счёта:</b> {settings.payment_ttl_minutes} мин.\n'
+        '━━━━━━━━━━━━━━━━━━\n'
+        'Отправьте точную сумму на указанный кошелёк и обязательно добавьте комментарий. '
+        'Без комментария платёж не сможет быть сопоставлен со счётом.',
+        parse_mode='HTML',
         reply_markup=kb.as_markup(),
+        disable_web_page_preview=True,
     )
 
 
@@ -122,7 +142,28 @@ async def check_payment(c: CallbackQuery, bot):
                 'После подтверждения транзакции в сети нажмите кнопку ещё раз.'
             )
     except Exception:
-        await c.message.answer('Не удалось проверить оплату сейчас. Попробуйте немного позже.')
+        logging.exception('Manual TON payment check failed for user %s', c.from_user.id)
+        await c.message.answer('Не удалось связаться с TONAPI. Попробуйте немного позже.')
+
+
+@router.callback_query(F.data == 'my_payments')
+async def my_payments(c: CallbackQuery):
+    async with Session() as db:
+        rows = (await db.scalars(
+            select(Payment).where(Payment.user_id == c.from_user.id)
+            .order_by(Payment.created_at.desc()).limit(10)
+        )).all()
+    if not rows:
+        await c.message.answer('У вас пока нет платежей.')
+    else:
+        lines = ['<b>Мои платежи</b>', '']
+        for payment in rows:
+            status = 'Подтверждён' if payment.status == 'confirmed' else ('Ожидает оплаты' if payment.status == 'pending' else payment.status)
+            lines.append(
+                f'#{payment.id} · {payment.amount_nano / 1_000_000_000:g} TON · {status}'
+            )
+        await c.message.answer('\n'.join(lines), parse_mode='HTML')
+    await c.answer()
 
 
 @router.callback_query(F.data=='ref')

@@ -1,26 +1,31 @@
 from sqlalchemy import select
 from app.db.session import Session
 from app.db.models import BotSetting
+from app.config import settings
 
 DEFAULTS = {
-    "parser_max_results": 10,
-    "trial_max_profiles": 3,
-    "parser_cooldown_seconds": 300,
-    "access_hours": 24,
-    "ton_price": 5,
+    'parser_max_results': settings.parser_max_results,
+    'trial_max_profiles': settings.trial_max_profiles,
+    'parser_cooldown_seconds': settings.parser_cooldown_seconds,
+    'access_hours': settings.access_hours,
+    'ton_price': int(settings.ton_price),
 }
 
+
 async def get_value(key: str) -> int:
+    if key not in DEFAULTS:
+        raise KeyError(f'Unknown setting: {key}')
     async with Session() as db:
         row = await db.get(BotSetting, key)
         return int(row.value) if row else int(DEFAULTS[key])
 
+
 async def set_value(key: str, value: int):
     if key not in DEFAULTS:
-        raise ValueError("Unknown setting")
+        raise ValueError('Unknown setting')
     value = int(value)
     if value < 0 or value > 1000000:
-        raise ValueError("Value out of range")
+        raise ValueError('Value out of range')
     async with Session() as db:
         row = await db.get(BotSetting, key)
         if row is None:

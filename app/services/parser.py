@@ -359,8 +359,12 @@ class ParserService:
                     )
                 await send_status(final_text, False)
                 from app.services.notifications import notify_admins
+                from app.services.formatting import format_user
+                async with Session() as db:
+                    requester = await db.get(User, telegram_user_id)
+                    requester_username = requester.username if requester else None
                 await notify_admins(
-                    f"✅ Парсинг завершён\nПользователь ID: {telegram_user_id}\n"
+                    f"Парсинг завершён\nЮз: {format_user(requester_username, telegram_user_id)}\n"
                     f"Найдено профилей: {sent}/{target}\nПроверено: {successful_checks}/{attempted_count}\n"
                     f"Ошибок: {access_errors + notification_errors}"
                 )
