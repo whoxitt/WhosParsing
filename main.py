@@ -22,11 +22,18 @@ async def parser_go(c, bot):
     await c.answer()
     status_message = await c.message.answer('Подготавливаю парсер…')
 
-    async def status(text):
+    async def status(text, running=False):
+        markup = None
+        if running:
+            stop_kb = InlineKeyboardBuilder()
+            stop_kb.button(text='⏹ Стоп', callback_data='parser_stop')
+            markup = stop_kb.as_markup()
         try:
-            await status_message.edit_text(text)
-        except Exception:
-            await bot.send_message(c.from_user.id, text)
+            await status_message.edit_text(text, reply_markup=markup)
+        except Exception as exc:
+            # Never create a stream of new progress messages. The status stays in one message.
+            if 'message is not modified' not in str(exc).lower():
+                logging.debug('Could not edit parser status message: %s', exc)
 
     async def result(username, uid, count, links, chat):
         name = '@' + username if username else f'Telegram ID: {uid}'
@@ -47,6 +54,14 @@ async def parser_go(c, bot):
 
     asyncio.create_task(run_job())
 
+
+async def parser_stop(c, bot):
+    if parser.stop(c.from_user.id):
+        await c.answer('Останавливаю поиск…')
+    else:
+        await c.answer('Активный поиск не найден.', show_alert=True)
+
+
 async def main():
     if not settings.bot_token: raise RuntimeError('BOT_TOKEN is missing')
     if not settings.database_url: raise RuntimeError('DATABASE_URL is missing')
@@ -55,6 +70,7 @@ async def main():
     bot=Bot(settings.bot_token); dp=Dispatcher()
     user.router.callback_query.register(parser_callback, F.data == 'parser')
     user.router.callback_query.register(parser_go, F.data == 'parser_go')
+    user.router.callback_query.register(parser_stop, F.data == 'parser_stop')
     dp.include_router(admin.router); dp.include_router(user.router)
     async def ton_worker():
         while True:

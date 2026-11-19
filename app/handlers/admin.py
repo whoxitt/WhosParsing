@@ -9,9 +9,11 @@ from app.config import settings
 from app.db.session import Session
 from app.db.models import TgAccount, Chat
 from app.services.account_manager import AccountManager
+from app.services.gift_detector import inspect_profile_gifts
 
 router = Router()
 account_manager: AccountManager | None = None
+pending_gift_diagnostics: dict[int, int] = {}
 
 
 def admin(m):
@@ -119,6 +121,62 @@ async def auth_text_input(m: Message):
                 await m.delete()
             except Exception:
                 pass
+        return
+
+    # One-off NFT diagnostic input requested from an account's settings page.
+    diagnostic_account_id = pending_gift_diagnostics.pop(m.from_user.id, None)
+    if diagnostic_account_id is not None:
+        raw = m.text.strip()
+        if raw.startswith('https://t.me/'):
+            raw = raw.split('t.me/', 1)[1].split('?', 1)[0].strip('/')
+        raw = raw.lstrip('@')
+        if not raw or '/' in raw or raw.startswith('+'):
+            await m.answer('Отправьте публичный username, например @My_name_sly. Диагностика отменена — нажмите кнопку ещё раз для повтора.')
+            return
+        status_message = await m.answer('Проверяю профиль через Telegram MTProto…')
+        try:
+            client = await account_manager.ensure_client(diagnostic_account_id)
+            entity = await client.get_entity(raw)
+            result = await inspect_profile_gifts(client, entity)
+            username = getattr(entity, 'username', None)
+            display_name = ' '.join(filter(None, [getattr(entity, 'first_name', None), getattr(entity, 'last_name', None)]))
+            lines = [
+                'Диагностика коллекционных NFT завершена',
+                f'Профиль: @{username}' if username else f'Профиль: {display_name or entity.id}',
+                f'Telethon: {result["telethon_version"]}',
+                f'MTProto-метод: {result["request_class"]}',
+                f'Тип ответа: {result["response_class"]}',
+                f'Количество по Telegram: {result["reported_count"] if result["reported_count"] is not None else "не указано"}',
+                f'Получено записей подарков: {result["returned_items"]}',
+                f'Страниц ответа: {result["pages"]}',
+                f'Коллекционных StarGiftUnique: {result["unique_count"]}',
+            ]
+            if result['gift_types']:
+                lines.append('Типы подарков: ' + ', '.join(f'{k}: {v}' for k, v in result['gift_types'].items()))
+            if result['wrapper_types']:
+                lines.append('Типы записей: ' + ', '.join(f'{k}: {v}' for k, v in result['wrapper_types'].items()))
+            if result['links']:
+                lines.append('NFT-ссылки:\n' + '\n'.join(result['links'][:30]))
+            elif result['returned_items'] == 0:
+                lines.append('Telegram вернул пустой список. Это не ошибка фильтра StarGiftUnique: сам MTProto-ответ не содержал подарков.')
+            else:
+                lines.append('Подарки получены, но среди них не обнаружен конструктор StarGiftUnique.')
+            if result['pagination_limit_reached']:
+                lines.append('Внимание: достигнут защитный лимит страниц (100); список мог быть неполным.')
+            await status_message.edit_text('\n'.join(lines))
+        except Exception as exc:
+            await status_message.edit_text(
+                'Ошибка диагностики NFT\n'
+                f'Аккаунт ID: {diagnostic_account_id}\n'
+                f'Профиль: @{raw}\n'
+                f'Ошибка: {type(exc).__name__}: {str(exc)[:1200]}'
+            )
+        finally:
+            try:
+                await m.delete()
+            except Exception:
+                pass
+        return
 
 
 async def account_keyboard(account_id: int):
@@ -131,6 +189,7 @@ async def account_keyboard(account_id: int):
         )).all()
         phone = account.phone
     kb = InlineKeyboardBuilder()
+    kb.button(text='🔎 Проверить NFT у профиля', callback_data=f'gift_diag:{account_id}')
     kb.button(text='🔄 Синхронизировать чаты', callback_data=f'acc_sync:{account_id}')
     for chat in chats:
         mark = '🟢' if chat.enabled else '⚪'
@@ -151,7 +210,7 @@ async def chats(c: CallbackQuery):
             select(Chat.account_id, func.count(Chat.id)).group_by(Chat.account_id)
         )).all())
     if not rows:
-        await c.message.answer('Нет сохранённых аккаунтов. Сначала добавьте аккаунт в разделе «Аккаунты».')
+        await c.message.edit_text('Нет сохранённых аккаунтов. Сначала добавьте аккаунт в разделе «Аккаунты».')
         await c.answer()
         return
     kb = InlineKeyboardBuilder()
@@ -162,7 +221,7 @@ async def chats(c: CallbackQuery):
             callback_data=f'acc_chats:{row.id}',
         )
     kb.adjust(1)
-    await c.message.answer('Выберите аккаунт — откроется список его чатов:', reply_markup=kb.as_markup())
+    await c.message.edit_text('Выберите аккаунт — откроется список его чатов:', reply_markup=kb.as_markup())
     await c.answer()
 
 
@@ -176,7 +235,33 @@ async def account_chats(c: CallbackQuery):
     if markup is None:
         await c.answer('Аккаунт не найден', show_alert=True)
         return
-    await c.message.answer(text, reply_markup=markup)
+    await c.message.edit_text(text, reply_markup=markup)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith('gift_diag:'))
+async def start_gift_diagnostic(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True)
+        return
+    if c.message.chat.type != 'private':
+        await c.answer('Диагностика доступна только в личном чате с ботом.', show_alert=True)
+        return
+    account_id = int(c.data.split(':', 1)[1])
+    async with Session() as db:
+        account = await db.get(TgAccount, account_id)
+        if not account:
+            await c.answer('Аккаунт не найден', show_alert=True)
+            return
+        if not account.is_enabled:
+            await c.answer('Сначала включите этот аккаунт.', show_alert=True)
+            return
+    pending_gift_diagnostics[c.from_user.id] = account_id
+    await c.message.answer(
+        f'Диагностика NFT через аккаунт {account_id}.\n'
+        'Отправьте username владельца, например @My_name_sly.\n'
+        'Будут показаны типы объектов, число подарков и ссылки t.me/nft.'
+    )
     await c.answer()
 
 
@@ -220,9 +305,9 @@ async def sync_account_button(c: CallbackQuery):
     try:
         count = await sync_account_chats(account_id)
         text, markup = await account_keyboard(account_id)
-        await c.message.answer(f'Синхронизация завершена. Новых чатов: {count}.\n\n{text}', reply_markup=markup)
+        await c.message.edit_text(f'Синхронизация завершена. Новых чатов: {count}.\n\n{text}', reply_markup=markup)
     except Exception as e:
-        await c.message.answer(f'Не удалось синхронизировать аккаунт ID {account_id}: {str(e)[:500]}')
+        await c.message.edit_text(f'Не удалось синхронизировать аккаунт ID {account_id}: {str(e)[:500]}')
 
 
 @router.callback_query(F.data.startswith('chat_toggle:'))
@@ -242,7 +327,7 @@ async def toggle_chat(c: CallbackQuery):
         enabled = row.enabled
         await db.commit()
     text, markup = await account_keyboard(account_id)
-    await c.message.answer(f'Чат «{title}» теперь {"включён" if enabled else "выключен"}.\n\n{text}', reply_markup=markup)
+    await c.message.edit_text(f'Чат «{title}» теперь {"включён" if enabled else "выключен"}.\n\n{text}', reply_markup=markup)
     await c.answer()
 
 
