@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    # Uses your existing external PostgreSQL. No DB container is created.
