@@ -5,7 +5,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from app.db.session import Session
-from app.db.models import User
+from app.db.models import User, Payment
 from app.config import settings
 from app.services.access import grant_access
 from app.services.ton import TonService
@@ -72,9 +72,43 @@ async def trial(c:CallbackQuery):
 @router.callback_query(F.data=='buy')
 async def buy(c:CallbackQuery):
     if not settings.ton_wallet_address or not settings.ton_api_token:
-        await c.answer('Оплата пока не настроена администратором.',show_alert=True); return
-    memo,amount=await ton.create_invoice(c.from_user.id)
-    await c.message.answer(f'Счёт на {amount} TON\nКошелёк: `{settings.ton_wallet_address}`\nКомментарий (memo): `{memo}`\n\nОтправьте точную сумму с указанным комментарием. Зачисление после подтверждения сети.',parse_mode='Markdown')
+        await c.answer('Оплата пока не настроена администратором.',show_alert=True)
+        return
+    memo, amount = await ton.create_invoice(c.from_user.id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text='Проверить оплату', callback_data='check_payment')
+    await c.message.answer(
+        f'Счёт на {amount} TON\nКошелёк: `{settings.ton_wallet_address}`\n'
+        f'Комментарий (memo): `{memo}`\n\n'
+        'Отправьте точную сумму с указанным комментарием. Зачисление после подтверждения сети.',
+        parse_mode='Markdown',
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data == 'check_payment')
+async def check_payment(c: CallbackQuery, bot):
+    await c.answer('Проверяю транзакции TON…')
+    try:
+        await ton.poll(bot)
+        async with Session() as db:
+            payment = await db.scalar(
+                select(Payment)
+                .where(Payment.user_id == c.from_user.id)
+                .order_by(Payment.created_at.desc())
+            )
+            user = await db.get(User, c.from_user.id)
+            active = bool(user and user.access_until and user.access_until > datetime.now(timezone.utc))
+        if payment and payment.status == 'confirmed' and active:
+            await c.message.answer('Оплата найдена и подтверждена. Доступ активирован.', reply_markup=menu(True))
+        else:
+            await c.message.answer(
+                'Платёж пока не найден. Проверьте точную сумму и memo. '
+                'После подтверждения транзакции в сети нажмите кнопку ещё раз.'
+            )
+    except Exception:
+        await c.message.answer('Не удалось проверить оплату сейчас. Попробуйте немного позже.')
+
 
 @router.callback_query(F.data=='ref')
 async def referral(c:CallbackQuery,bot):

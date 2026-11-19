@@ -1,9 +1,9 @@
-import re
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
+from telethon import utils
 from app.config import settings
 from app.db.session import Session
 from app.db.models import TgAccount, Chat
@@ -25,35 +25,70 @@ async def admin_home(m:Message):
 async def accounts(c:CallbackQuery):
     if c.from_user.id not in settings.admins: return
     async with Session() as db: rows=(await db.scalars(select(TgAccount))).all()
-    text='Аккаунты:\n'+'\n'.join(f'#{x.id} {x.phone} — {x.status} — '+('включён' if x.is_enabled else 'выключен') for x in rows)
+    text='Аккаунты:\n'+'\n'.join(f'#{x.id} {x.phone} (API ID: {x.api_id or "legacy"}) — {x.status} — '+('включён' if x.is_enabled else 'выключен') for x in rows)
     await c.message.answer(text or 'Аккаунтов пока нет.')
 
 @router.callback_query(F.data=='adm_add_account')
 async def add_account(c:CallbackQuery):
     if c.from_user.id not in settings.admins: return
-    await c.message.answer('Отправьте номер телефона в международном формате, например +79990000000.')
+    if c.message.chat.type != 'private':
+        await c.answer('Добавление аккаунта доступно только в личном чате с ботом.', show_alert=True)
+        return
+    account_manager.request_api_id(c.from_user.id)
+    await c.message.answer('Добавление Telethon-аккаунта.\n1) Отправьте API ID из https://my.telegram.org.')
 
-@router.message(F.text.regexp(r'^\+?[0-9 ()-]{8,20}$'))
-async def phone_input(m:Message):
-    if not admin(m): return
-    try: await m.answer(await account_manager.start_login(m.from_user.id,m.text))
-    except Exception as e: await m.answer(f'Не удалось запросить код: {str(e)[:300]}')
+@router.message(F.text & ~F.text.startswith('/'))
+async def auth_text_input(m: Message):
+    if not admin(m) or not account_manager:
+        return
+    if m.chat.type != "private":
+        return
 
-@router.message(F.text.regexp(r'^[0-9 ]{4,12}$'))
-async def code_input(m:Message):
-    if not admin(m): return
-    try:
-        result=await account_manager.finish_login(m.from_user.id,m.text)
-        await m.answer('Требуется пароль двухэтапной авторизации. Отправьте пароль отдельным сообщением.' if result=='NEED_2FA' else result)
-    except Exception as e: await m.answer(f'Ошибка авторизации: {str(e)[:300]}')
+    # Credentials are accepted only in the admin's private chat. Try to remove
+    # the sensitive incoming message after reading it (best effort).
+    setup_stage = account_manager.setup_stage(m.from_user.id)
+    if setup_stage in {"api_id", "api_hash", "phone"}:
+        value = m.text.strip()
+        try:
+            if setup_stage == "api_id":
+                result = await account_manager.receive_api_id(m.from_user.id, value)
+            elif setup_stage == "api_hash":
+                result = await account_manager.receive_api_hash(m.from_user.id, value)
+            else:
+                result = await account_manager.start_login(m.from_user.id, value)
+            await m.answer(result)
+        except Exception as e:
+            await m.answer(f"Не удалось обработать данные: {str(e)[:300]}")
+        finally:
+            try: await m.delete()
+            except Exception: pass
+        return
 
-@router.message(F.text, F.reply_to_message)
-async def password_input(m:Message):
-    if not admin(m): return
-    try:
-        result=await account_manager.finish_login(m.from_user.id,'',m.text)
-        await m.answer(result)
-    except Exception as e: await m.answer(f'Ошибка 2FA: {str(e)[:300]}')
+    stage = account_manager.pending_stage(m.from_user.id)
+    if stage == "code":
+        try:
+            result = await account_manager.finish_login(m.from_user.id, m.text)
+            if result == "NEED_2FA":
+                await m.answer("Включена двухэтапная защита Telegram. Теперь отправьте пароль 2FA отдельным сообщением.")
+            else:
+                await m.answer(result)
+        except Exception as e:
+            await m.answer(f"Не удалось войти. Проверьте код и попробуйте ещё раз.\n{str(e)[:250]}")
+        finally:
+            try: await m.delete()
+            except Exception: pass
+        return
+
+    if stage == "password":
+        try:
+            result = await account_manager.finish_password(m.from_user.id, m.text)
+            await m.answer(result)
+        except Exception as e:
+            await m.answer(f"Ошибка пароля 2FA: {str(e)[:250]}")
+        finally:
+            try: await m.delete()
+            except Exception: pass
+        return
 
 @router.callback_query(F.data=='adm_chats')
 async def chats(c:CallbackQuery):
@@ -74,10 +109,12 @@ async def sync_chats(m:Message):
         if not (dialog.is_group or dialog.is_channel): continue
         entity=dialog.entity
         async with Session() as db:
-            row=await db.scalar(select(Chat).where(Chat.account_id==aid,Chat.peer_id==entity.id))
+            row=await db.scalar(select(Chat).where(Chat.account_id==aid,Chat.peer_id.in_([entity.id, utils.get_peer_id(entity)])))
             if row is None:
-                row=Chat(account_id=aid,peer_id=entity.id,title=dialog.name or str(entity.id),username=getattr(entity,'username',None)); db.add(row); count+=1
-            else: row.title=dialog.name or row.title
+                row=Chat(account_id=aid,peer_id=utils.get_peer_id(entity),title=dialog.name or str(entity.id),username=getattr(entity,'username',None)); db.add(row); count+=1
+            else:
+                row.peer_id=utils.get_peer_id(entity)
+                row.title=dialog.name or row.title
             await db.commit()
     await m.answer(f'Синхронизация завершена. Добавлено новых чатов: {count}.')
 

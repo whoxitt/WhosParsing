@@ -89,6 +89,12 @@ class ParserService:
             await send_status('Парсер готов к работе. Идёт поиск...')
             sent = 0
             checked = set()
+            started_at = asyncio.get_running_loop().time()
+            checked_count = 0
+
+            def elapsed_text():
+                seconds = int(asyncio.get_running_loop().time() - started_at)
+                return f"{seconds // 60:02d}:{seconds % 60:02d}"
             async with Session() as db:
                 chats = (await db.scalars(select(Chat).where(Chat.enabled.is_(True)).order_by(Chat.id))).all()
                 accounts = (await db.scalars(select(TgAccount).where(
@@ -104,6 +110,13 @@ class ParserService:
             for chat in chats:
                 if sent >= target or asyncio.get_running_loop().time() > deadline:
                     break
+                await send_status(
+                    f"Парсер работает\n"
+                    f"Чат: {chat.title}\n"
+                    f"Прошло времени: {elapsed_text()}\n"
+                    f"Профилей проверено: {checked_count}\n"
+                    f"Найдено профилей: {sent}/{target}"
+                )
                 client = self.accounts.clients.get(chat.account_id)
                 if not client:
                     continue
@@ -135,8 +148,23 @@ class ParserService:
                             if not isinstance(sender, TLUser) or sender.id in checked:
                                 continue
                             checked.add(sender.id)
+                            checked_count += 1
+                            if checked_count % 10 == 0:
+                                await send_status(
+                                    f"Парсер работает\n"
+                                    f"Чат: {chat.title}\n"
+                                    f"Прошло времени: {elapsed_text()}\n"
+                                    f"Профилей проверено: {checked_count}\n"
+                                    f"Найдено профилей: {sent}/{target}"
+                                )
                             if await self._check_and_issue(client, sender, chat, telegram_user_id, paid_active, send_result):
                                 sent += 1
                     except Exception:
                         continue
-            await send_status(f'Поиск завершён. Найдено и отправлено новых профилей: {sent}.')
+            await send_status(
+                f"Поиск завершён\n"
+                f"Последний чат: {chat.title if chats else '—'}\n"
+                f"Прошло времени: {elapsed_text()}\n"
+                f"Профилей проверено: {checked_count}\n"
+                f"Найдено и отправлено новых профилей: {sent}"
+            )

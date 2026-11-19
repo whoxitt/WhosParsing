@@ -22,6 +22,8 @@ class TgAccount(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     phone: Mapped[str] = mapped_column(String(32), unique=True)
     session_name: Mapped[str] = mapped_column(String(128), unique=True)
+    api_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    api_hash_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     is_authorized: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(32), default='disconnected')

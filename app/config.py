@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     telegram_api_id: int = Field(default=0, alias='TELEGRAM_API_ID')
     telegram_api_hash: str = Field(default='', alias='TELEGRAM_API_HASH')
+    account_credentials_secret: str = Field(default='', alias='ACCOUNT_CREDENTIALS_SECRET')
     telethon_session_dir: str = Field(default='/app/data/sessions', alias='TELETHON_SESSION_DIR')
 
     ton_network: str = Field(default='mainnet', alias='TON_NETWORK')
