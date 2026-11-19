@@ -1,7 +1,7 @@
 import asyncio, logging
 from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher
-from aiogram.types import InlineKeyboardBuilder
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from app.config import settings
 from app.db.session import init_db, Session, engine
