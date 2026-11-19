@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import logging
 from html import escape
+from urllib.parse import urlencode
 from aiogram import Router, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery
@@ -95,26 +96,32 @@ async def buy(c:CallbackQuery):
         return
     await c.answer()
     try:
-        memo, amount = await ton.create_invoice(c.from_user.id)
+        memo, amount, amount_nano = await ton.create_invoice(c.from_user.id)
     except Exception:
         logging.exception('Could not create TON invoice for user %s', c.from_user.id)
         await c.answer('Не удалось создать счёт. Попробуйте позже.', show_alert=True)
         return
+    # Tonkeeper opens a pre-filled transfer: recipient, exact nanoTON amount,
+    # and unique invoice memo are all embedded in the payment deep link.
+    transfer_query = urlencode({'amount': str(amount_nano), 'text': memo})
+    tonkeeper_url = (
+        f'https://app.tonkeeper.com/transfer/{settings.ton_wallet_address}'
+        f'?{transfer_query}'
+    )
     kb = InlineKeyboardBuilder()
+    kb.button(text='Оплатить через Tonkeeper', url=tonkeeper_url)
     kb.button(text='Проверить оплату', callback_data='check_payment')
-    kb.button(text='История моих платежей', callback_data='my_payments')
-    kb.button(text='Открыть кошелёк', url=f'https://tonviewer.com/{settings.ton_wallet_address}')
+    kb.button(text='История платежей', callback_data='my_payments')
     kb.adjust(1)
     await c.message.answer(
         '<b>Покупка доступа</b>\n'
         '━━━━━━━━━━━━━━━━━━\n'
-        f'<b>К оплате:</b> {amount} TON\n'
-        f'<b>Кошелёк:</b> <code>{escape(settings.ton_wallet_address)}</code>\n'
+        f'<b>Сумма:</b> {escape(str(amount))} TON\n'
         f'<b>Комментарий:</b> <code>{escape(memo)}</code>\n'
-        f'<b>Срок действия счёта:</b> {settings.payment_ttl_minutes} мин.\n'
+        f'<b>Счёт действует:</b> {settings.payment_ttl_minutes} мин.\n'
         '━━━━━━━━━━━━━━━━━━\n'
-        'Отправьте точную сумму на указанный кошелёк и обязательно добавьте комментарий. '
-        'Без комментария платёж не сможет быть сопоставлен со счётом.',
+        'Нажмите «Оплатить через Tonkeeper» и подтвердите перевод в кошельке. '
+        'Сумма и комментарий будут заполнены автоматически.',
         parse_mode='HTML',
         reply_markup=kb.as_markup(),
         disable_web_page_preview=True,

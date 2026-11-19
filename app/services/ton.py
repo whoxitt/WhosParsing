@@ -4,6 +4,7 @@ import binascii
 import logging
 import secrets
 import string
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import select
@@ -23,7 +24,15 @@ class TonService:
     async def create_invoice(self, user_id: int):
         from app.services.bot_settings import get_value
         price = await get_value('ton_price')
-        nano = int(price) * 1_000_000_000
+        try:
+            price_decimal = Decimal(str(price))
+            if not price_decimal.is_finite() or price_decimal <= 0:
+                raise ValueError('Цена доступа должна быть больше нуля')
+            nano = int((price_decimal * Decimal(1_000_000_000)).quantize(Decimal('1'), rounding=ROUND_DOWN))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError(f'Некорректная цена доступа в TON: {price!r}') from exc
+        if nano <= 0:
+            raise ValueError('Сумма счёта слишком мала для перевода в nanoTON')
         memo = self.new_memo()
         async with Session() as db:
             p = Payment(
@@ -34,7 +43,10 @@ class TonService:
             )
             db.add(p)
             await db.commit()
-        return memo, price
+        # Return the exact amount stored in the invoice; the same nanoTON value
+        # is used in the Tonkeeper deep link and later payment verification.
+        price_text = format(Decimal(nano) / Decimal(1_000_000_000), 'f').rstrip('0').rstrip('.')
+        return memo, price_text, nano
 
     async def recent_transactions(self):
         if not settings.ton_wallet_address or not settings.ton_api_token:
