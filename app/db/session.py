@@ -13,3 +13,6 @@ async def init_db():
         # Additive migration for existing PostgreSQL installations.
         await conn.execute(text("ALTER TABLE tg_accounts ADD COLUMN IF NOT EXISTS api_id BIGINT"))
         await conn.execute(text("ALTER TABLE tg_accounts ADD COLUMN IF NOT EXISTS api_hash_encrypted TEXT"))
+        # Tracks whether a discovered NFT owner notification reached the requesting user.
+        # Existing orphaned owner_profiles rows remain eligible for delivery.
+        await conn.execute(text("ALTER TABLE owner_profiles ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ"))

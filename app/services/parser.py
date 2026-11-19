@@ -35,17 +35,30 @@ class ParserService:
         return True
 
     async def _check_and_issue(self, client, sender, chat, user_id, paid_active, send_result):
+        """Return (status, gift_count, links). Notification failures never become access errors."""
         if not isinstance(sender, TLUser) or sender.bot or sender.deleted:
-            return False
+            return "skipped", 0, []
+
         try:
             count, links = await get_profile_gifts(client, sender)
         except Exception:
-            # Do not count an inaccessible profile as a successful "no gifts" result.
-            logger.warning("Could not inspect gifts for Telegram user %s: %s", sender.id, exc_info=True)
-            return None
+            logger.exception(
+                "NFT_ACCESS_ERROR account_id=%s chat_id=%s user_id=%s username=%s",
+                chat.account_id, chat.peer_id, sender.id, sender.username,
+            )
+            return "access_error", 0, []
+
+        logger.info(
+            "NFT_CHECK account_id=%s chat_id=%s user_id=%s username=%s unique_count=%s links=%s",
+            chat.account_id, chat.peer_id, sender.id, sender.username, count, links,
+        )
         if count <= 0:
-            return False
+            return "no_gifts", 0, []
+
+        now = datetime.now(timezone.utc)
         async with Session() as db:
+            # Insert if new, then lock/read the canonical row. A previous version could
+            # leave an unissued row after failing to deliver its Telegram notification.
             stmt = insert(OwnerProfile).values(
                 telegram_user_id=sender.id,
                 username=sender.username,
@@ -55,32 +68,79 @@ class ParserService:
                 source_chat_title=chat.title,
                 source_chat_id=chat.peer_id,
                 discovered_by_account_id=chat.account_id,
-                issued_to_user_id=user_id,
-                issued_at=datetime.now(timezone.utc)
-            ).on_conflict_do_nothing(index_elements=['telegram_user_id']).returning(OwnerProfile.id)
-            result = await db.execute(stmt)
-            inserted = result.scalar_one_or_none()
-            if inserted is None:
-                return False
+                discovered_at=now,
+                issued_to_user_id=None,
+                issued_at=None,
+            ).on_conflict_do_nothing(index_elements=['telegram_user_id'])
+            await db.execute(stmt)
+            row = await db.scalar(
+                select(OwnerProfile)
+                .where(OwnerProfile.telegram_user_id == sender.id)
+                .with_for_update()
+            )
+            if row is None:
+                await db.rollback()
+                logger.error("NFT_DB_ERROR user_id=%s: row missing after insert", sender.id)
+                return "db_error", count, links
+
+            # Keep existing owner details fresh, including when reclaiming an orphaned row.
+            row.username = sender.username
+            row.display_name = ' '.join(filter(None, [sender.first_name, sender.last_name]))
+            row.gift_count = count
+            row.gift_links = '\n'.join(links)
+            row.source_chat_title = chat.title
+            row.source_chat_id = chat.peer_id
+            row.discovered_by_account_id = chat.account_id
+
+            if row.issued_to_user_id not in (None, user_id):
+                assigned_to_other = row.issued_to_user_id
+                await db.commit()
+                logger.info(
+                    "NFT_ALREADY_ASSIGNED user_id=%s assigned_to=%s",
+                    sender.id, assigned_to_other,
+                )
+                return "already_assigned", count, links
+
+            if row.issued_to_user_id is None:
+                row.issued_to_user_id = user_id
+                row.issued_at = now
+
+            if row.delivered_at is not None:
+                await db.commit()
+                logger.info("NFT_ALREADY_DELIVERED user_id=%s recipient=%s", sender.id, user_id)
+                return "already_delivered", count, links
+
             await db.commit()
+
         try:
             await send_result(sender.username, sender.id, count, links, chat.title)
         except Exception:
-            async with Session() as db:
-                row = await db.scalar(select(OwnerProfile).where(OwnerProfile.telegram_user_id == sender.id))
-                if row and row.issued_to_user_id == user_id:
-                    row.issued_to_user_id = None
-                    row.issued_at = None
-                    await db.commit()
-            logger.exception("Could not send discovered profile %s to user %s", sender.id, user_id)
-            return None
-        if not paid_active:
-            async with Session() as db:
-                trial_user = await db.get(User, user_id)
-                if trial_user:
-                    trial_user.trial_profiles_sent += 1
-                    await db.commit()
-        return True
+            # Do not release the globally unique profile: it is reserved for this user.
+            # delivered_at stays NULL, so the next parser run retries the notification.
+            logger.exception(
+                "NFT_NOTIFICATION_PENDING owner_id=%s recipient_id=%s username=%s",
+                sender.id, user_id, sender.username,
+            )
+            return "notification_pending", count, links
+
+        async with Session() as db:
+            row = await db.scalar(
+                select(OwnerProfile)
+                .where(OwnerProfile.telegram_user_id == sender.id)
+                .with_for_update()
+            )
+            if row and row.issued_to_user_id == user_id and row.delivered_at is None:
+                row.delivered_at = datetime.now(timezone.utc)
+            trial_user = await db.get(User, user_id)
+            if not paid_active and trial_user:
+                trial_user.trial_profiles_sent += 1
+            await db.commit()
+
+        logger.info(
+            "NFT_DELIVERED owner_id=%s recipient_id=%s username=%s gift_count=%s",
+            sender.id, user_id, sender.username, count,
+        )
+        return "sent", count, links
 
     async def run_for(self, telegram_user_id: int, send_result, send_status):
         lock = self.user_locks.setdefault(telegram_user_id, asyncio.Lock())
@@ -116,7 +176,11 @@ class ParserService:
                 attempted_count = 0
                 successful_checks = 0
                 access_errors = 0
-                checked = set()
+                notification_errors = 0
+                already_assigned = 0
+                checked_successfully: set[int] = set()
+                attempted_by_account: set[tuple[int, int]] = set()
+                found_names: list[str] = []
                 started_at = asyncio.get_running_loop().time()
 
                 def elapsed_text():
@@ -135,18 +199,21 @@ class ParserService:
                         f"Успешных проверок NFT: {successful_checks}\n"
                         f"Ошибок доступа к профилям: {access_errors}\n"
                         f"Найдено профилей: {sent}/{target}"
+                        + (f"\nОшибок отправки уведомления: {notification_errors}" if notification_errors else "")
                     )
 
                 async with Session() as db:
-                    chats = (await db.scalars(select(Chat).where(Chat.enabled.is_(True)).order_by(Chat.id))).all()
+                    chats = (await db.scalars(
+                        select(Chat).where(Chat.enabled.is_(True)).order_by(Chat.id)
+                    )).all()
                     account_ids = set((await db.scalars(select(TgAccount.id).where(
                         TgAccount.is_enabled.is_(True), TgAccount.is_authorized.is_(True)
                     ))).all())
+                chats = [chat for chat in chats if chat.account_id in account_ids]
                 if not chats:
-                    await send_status('Нет активных чатов. Включите хотя бы один чат в разделе «Чаты».', False)
+                    await send_status('Нет активных чатов у авторизованных аккаунтов. Проверьте раздел «Чаты» и статус Telethon-аккаунтов.', False)
                     return
 
-                # Scan only chats assigned to enabled accounts.
                 random.shuffle(chats)
                 deadline = asyncio.get_running_loop().time() + settings.parser_job_timeout_seconds
                 last_chat_title = '—'
@@ -155,8 +222,7 @@ class ParserService:
                         break
                     last_chat_title = chat.title
                     await send_status(progress_text(chat.title), True)
-                    if chat.account_id not in account_ids:
-                        continue
+
                     try:
                         client = await self.accounts.ensure_client(chat.account_id)
                     except Exception:
@@ -180,37 +246,79 @@ class ParserService:
                                     if len(candidates) >= settings.parser_scan_messages_limit * 5:
                                         break
                             except Exception:
-                                logger.debug("Participant list unavailable for %s; trying recent messages", chat.title, exc_info=True)
+                                logger.warning(
+                                    "PARTICIPANT_ENUM_ERROR account_id=%s chat_id=%s",
+                                    chat.account_id, chat.peer_id, exc_info=True,
+                                )
                                 candidates = []
+
                             if not candidates and not stop_event.is_set():
                                 async for msg in client.iter_messages(entity, limit=settings.parser_scan_messages_limit):
                                     if stop_event.is_set():
                                         break
-                                    sender = msg.sender or await msg.get_sender()
+                                    try:
+                                        sender = msg.sender or await msg.get_sender()
+                                    except Exception:
+                                        logger.warning(
+                                            "MESSAGE_SENDER_ERROR account_id=%s chat_id=%s message_id=%s",
+                                            chat.account_id, chat.peer_id, msg.id, exc_info=True,
+                                        )
+                                        continue
                                     if sender is not None:
                                         candidates.append(sender)
+
                             random.shuffle(candidates)
                             for sender in candidates:
                                 if stop_event.is_set() or sent >= target or asyncio.get_running_loop().time() > deadline:
                                     break
-                                if not isinstance(sender, TLUser) or sender.bot or sender.deleted or sender.id in checked:
+                                if not isinstance(sender, TLUser) or sender.bot or sender.deleted:
                                     continue
-                                checked.add(sender.id)
+                                if sender.id in checked_successfully:
+                                    continue
+                                account_user_key = (chat.account_id, sender.id)
+                                if account_user_key in attempted_by_account:
+                                    continue
+                                attempted_by_account.add(account_user_key)
                                 attempted_count += 1
-                                outcome = await self._check_and_issue(
+
+                                outcome, gift_count, links = await self._check_and_issue(
                                     client, sender, chat, telegram_user_id, paid_active, send_result
                                 )
-                                if outcome is None:
+
+                                if outcome == "access_error":
                                     access_errors += 1
+                                elif outcome == "db_error":
+                                    access_errors += 1
+                                    logger.error("Could not save NFT owner %s", sender.id)
                                 else:
                                     successful_checks += 1
-                                    if outcome:
-                                        sent += 1
-                                if attempted_count % 10 == 0:
+                                    checked_successfully.add(sender.id)
+
+                                if outcome == "sent":
+                                    sent += 1
+                                    found_names.append(
+                                        f"@{sender.username}" if sender.username else f"ID {sender.id}"
+                                    )
+                                elif outcome == "notification_pending":
+                                    sent += 1
+                                    notification_errors += 1
+                                    found_names.append(
+                                        f"@{sender.username}" if sender.username else f"ID {sender.id}"
+                                    )
+                                elif outcome == "already_assigned":
+                                    already_assigned += 1
+                                elif outcome == "already_delivered":
+                                    # This profile is already delivered to this user; don't send twice.
+                                    pass
+
+                                if attempted_count % 5 == 0:
                                     await send_status(progress_text(chat.title), True)
                         except Exception:
                             access_errors += 1
-                            logger.exception("Parser failed in chat %s (account %s)", chat.title, chat.account_id)
+                            logger.exception(
+                                "PARSER_CHAT_ERROR account_id=%s chat_id=%s title=%s",
+                                chat.account_id, chat.peer_id, chat.title,
+                            )
                             await send_status(progress_text(chat.title), True)
 
                 if stop_event.is_set():
@@ -219,9 +327,19 @@ class ParserService:
                     prefix = 'Поиск остановлен: достигнут лимит времени'
                 else:
                     prefix = 'Поиск завершён'
+
                 final_text = progress_text(last_chat_title, prefix) + (
                     f"\n\nИтог: успешно проверено {successful_checks} из {attempted_count} профилей."
                 )
+                if found_names:
+                    final_text += "\n\nНайдены владельцы NFT:\n" + "\n".join(found_names)
+                if notification_errors:
+                    final_text += (
+                        f"\n\nВнимание: {notification_errors} уведомлений не доставлено. "
+                        "Профили сохранены и закреплены за вами; отправка будет повторена при следующем запуске."
+                    )
+                if already_assigned:
+                    final_text += f"\nУже выданы другим пользователям: {already_assigned}."
                 if attempted_count and access_errors:
                     final_text += (
                         f"\nНе удалось проверить: {access_errors}. Это не означает, что у этих пользователей нет подарков."

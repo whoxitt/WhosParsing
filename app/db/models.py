@@ -56,6 +56,7 @@ class OwnerProfile(Base):
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     issued_to_user_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey('users.id'))
     issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (Index('ix_owner_unissued','issued_to_user_id','discovered_at'),)
 
 class Payment(Base):

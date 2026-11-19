@@ -36,14 +36,20 @@ async def parser_go(c, bot):
                 logging.debug('Could not edit parser status message: %s', exc)
 
     async def result(username, uid, count, links, chat):
+        # Use a plain text message: a rejected tg:// inline button must not
+        # make a successfully discovered NFT look like an access failure.
         name = '@' + username if username else f'Telegram ID: {uid}'
-        gift_info = f'Количество коллекционных NFT: {count}'
-        if count == 1 and links:
-            gift_info = links[0]
-        text = f'{name}\n{gift_info}\nИсточник: {chat}'
-        kb = InlineKeyboardBuilder()
-        kb.button(text='Перейти в профиль', url=f'tg://user?id={uid}')
-        await bot.send_message(c.from_user.id, text, reply_markup=kb.as_markup())
+        lines = [
+            '🎁 Найден владелец коллекционного NFT',
+            name,
+            f'Telegram ID: {uid}',
+            f'Количество коллекционных NFT: {count}',
+        ]
+        if links:
+            lines.append('NFT-ссылки:')
+            lines.extend(links)
+        lines.append(f'Источник: {chat}')
+        await bot.send_message(c.from_user.id, '\n'.join(lines), disable_web_page_preview=True)
 
     async def run_job():
         try:
