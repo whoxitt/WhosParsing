@@ -77,7 +77,6 @@ class AccountManager:
         api_hash = value.strip()
         if not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
             raise ValueError("API Hash должен состоять из 32 шестнадцатеричных символов. Проверьте значение на my.telegram.org.")
-        # Fail early if encryption key is not configured; never persist credentials in plaintext.
         self._encrypt_hash(api_hash)
         item["api_hash"] = api_hash
         item["stage"] = "phone"
@@ -93,11 +92,11 @@ class AccountManager:
                         api_id = int(row.api_id)
                         api_hash = self._decrypt_hash(row.api_hash_encrypted)
                     elif settings.telegram_api_id and settings.telegram_api_hash:
-                        # Backward compatibility for accounts created before per-account API credentials.
                         api_id, api_hash = settings.telegram_api_id, settings.telegram_api_hash
                     else:
                         row.status = "credentials_missing"
                         row.last_error = "Для аккаунта не сохранены API ID/API Hash"
+                        row.is_authorized = False
                         continue
                     client = self._client(row.session_name, api_id, api_hash)
                     await client.connect()
@@ -116,6 +115,63 @@ class AccountManager:
                             pass
             await db.commit()
 
+    async def ensure_client(self, account_id: int) -> TelegramClient:
+        """Return a connected client, restoring its session from DB if needed."""
+        client = self.clients.get(account_id)
+        if client is not None:
+            try:
+                if client.is_connected() and await client.is_user_authorized():
+                    return client
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            self.clients.pop(account_id, None)
+
+        async with Session() as db:
+            row = await db.get(TgAccount, account_id)
+            if row is None:
+                raise ValueError(f"Аккаунт с внутренним ID {account_id} не найден в базе данных.")
+            if not row.is_enabled:
+                raise ValueError("Этот аккаунт отключён. Включите его через управление аккаунтами.")
+            if not row.api_id or not row.api_hash_encrypted:
+                raise ValueError("У аккаунта не сохранены API ID/API Hash. Переподключите аккаунт.")
+            api_id = int(row.api_id)
+            api_hash = self._decrypt_hash(row.api_hash_encrypted)
+            session_name = row.session_name
+
+        restored = self._client(session_name, api_id, api_hash)
+        try:
+            await restored.connect()
+            if not await restored.is_user_authorized():
+                await restored.disconnect()
+                async with Session() as db:
+                    row = await db.get(TgAccount, account_id)
+                    if row:
+                        row.is_authorized = False
+                        row.status = "reauthorization_required"
+                        row.last_error = "Telethon-сессия не авторизована; требуется повторный вход"
+                        await db.commit()
+                raise ValueError("Сессия Telegram не авторизована. Удалите аккаунт и подключите его заново через «Добавить аккаунт».")
+            self.clients[account_id] = restored
+            async with Session() as db:
+                row = await db.get(TgAccount, account_id)
+                if row:
+                    row.is_authorized = True
+                    row.status = "online"
+                    row.last_error = None
+                    await db.commit()
+            return restored
+        except Exception:
+            try:
+                await restored.disconnect()
+            except Exception:
+                pass
+            raise
+
     async def start_login(self, admin_id: int, phone: str):
         setup = self.setup.get(admin_id)
         if not setup or setup.get("stage") != "phone":
@@ -125,8 +181,10 @@ class AccountManager:
             raise ValueError("Введите номер в международном формате, например +79990000000")
         old = self.pending.pop(admin_id, None)
         if old:
-            try: await old["client"].disconnect()
-            except Exception: pass
+            try:
+                await old["client"].disconnect()
+            except Exception:
+                pass
         name = "acc_" + re.sub(r"\D", "", phone)
         client = self._client(name, setup["api_id"], setup["api_hash"])
         try:
@@ -191,7 +249,8 @@ class AccountManager:
 
     async def disconnect(self, account_id: int):
         client = self.clients.pop(account_id, None)
-        if client: await client.disconnect()
+        if client:
+            await client.disconnect()
         async with Session() as db:
             row = await db.get(TgAccount, account_id)
             if row:
@@ -201,8 +260,12 @@ class AccountManager:
 
     async def close(self):
         for client in list(self.clients.values()):
-            try: await client.disconnect()
-            except Exception: pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
         for item in self.pending.values():
-            try: await item["client"].disconnect()
-            except Exception: pass
+            try:
+                await item["client"].disconnect()
+            except Exception:
+                pass
