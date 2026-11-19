@@ -67,6 +67,7 @@ async def main():
     if not settings.database_url: raise RuntimeError('DATABASE_URL is missing')
     await init_db(); await accounts.restore_all()
     admin.account_manager=accounts
+    admin.parser_service=parser
     bot=Bot(settings.bot_token); dp=Dispatcher()
     user.router.callback_query.register(parser_callback, F.data == 'parser')
     user.router.callback_query.register(parser_go, F.data == 'parser_go')

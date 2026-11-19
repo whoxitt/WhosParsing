@@ -2,17 +2,18 @@ from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete, update
 from telethon import utils
 
 from app.config import settings
 from app.db.session import Session
-from app.db.models import TgAccount, Chat
+from app.db.models import TgAccount, Chat, User, OwnerProfile, Payment, ReferralReward
 from app.services.account_manager import AccountManager
 from app.services.gift_detector import inspect_profile_gifts
 
 router = Router()
 account_manager: AccountManager | None = None
+parser_service = None
 pending_gift_diagnostics: dict[int, int] = {}
 
 
@@ -26,6 +27,7 @@ def kb_admin():
     kb.button(text='Добавить аккаунт', callback_data='adm_add_account')
     kb.button(text='Чаты', callback_data='adm_chats')
     kb.button(text='Мониторинг', callback_data='adm_status')
+    kb.button(text='🗑 Очистить найденные NFT-профили', callback_data='adm_db_reset')
     kb.adjust(1)
     return kb.as_markup()
 
@@ -446,3 +448,67 @@ async def account_enable(m: Message):
         row.is_enabled = True
         await db.commit()
     await m.answer('Аккаунт включён. При необходимости сессия восстановится при синхронизации или перезапуске.')
+
+
+@router.callback_query(F.data == 'adm_db_reset')
+async def db_reset_prompt(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text='⚠️ Да, удалить найденные NFT-профили', callback_data='adm_db_reset_confirm')
+    kb.button(text='Отмена', callback_data='adm_db_reset_cancel')
+    kb.adjust(1)
+    await c.message.edit_text(
+        '⚠️ Очистка результатов парсинга\n\n'
+        'Будут удалены только найденные NFT-профили из базы (таблица owner_profiles).\n'
+        'Пользователи, доступ и пробные лимиты, платежи, реферальные награды, '
+        'Telethon-аккаунты, чаты и настройки парсинга останутся без изменений.\n\n'
+        'Это действие нельзя отменить. Продолжить?',
+        reply_markup=kb.as_markup()
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data == 'adm_db_reset_cancel')
+async def db_reset_cancel(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True)
+        return
+    await c.message.edit_text('Очистка результатов парсинга отменена.', reply_markup=kb_admin())
+    await c.answer('Отменено')
+
+
+@router.callback_query(F.data == 'adm_db_reset_confirm')
+async def db_reset_confirm(c: CallbackQuery):
+    if c.from_user.id not in settings.admins:
+        await c.answer('Нет доступа', show_alert=True)
+        return
+
+    # Не очищаем результаты во время активного парсинга: он мог бы тут же создать их снова.
+    if parser_service is not None and any(
+        not event.is_set() for event in parser_service.stop_events.values()
+    ):
+        await c.answer('Сначала остановите все активные поиски.', show_alert=True)
+        return
+
+    await c.answer('Очищаю найденные NFT-профили…')
+    try:
+        async with Session() as db:
+            result = await db.execute(delete(OwnerProfile))
+            deleted_count = max(result.rowcount or 0, 0)
+            await db.commit()
+
+        await c.message.edit_text(
+            f'✅ Результаты парсинга очищены.\n\nУдалено NFT-профилей: {deleted_count}.\n\n'
+            'Все остальные данные, аккаунты, чаты, настройки и доступы сохранены.',
+            reply_markup=kb_admin()
+        )
+    except Exception as exc:
+        await c.message.edit_text(
+            '❌ Не удалось очистить найденные NFT-профили.\n'
+            f'Ошибка: {type(exc).__name__}: {str(exc)[:700]}',
+            reply_markup=kb_admin()
+        )
+
+
